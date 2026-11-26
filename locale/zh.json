@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "简单 Cursor",
+    "description": "第三方社区插件（非 Cursor 官方出品）。通过官方 SDK 将个人 Cursor 订阅接入 DSH 作为可选模型提供方，支持上下文窗口变体选择与 DSH 工具调用；可在「更多 → 设置 → Cursor」中托管 API Key（CURSOR_API_KEY）并查看订阅用量。"
+  }
+}

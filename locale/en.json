@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Simple Cursor",
+    "description": "Third-party community plugin (not affiliated with Cursor). Connects your Cursor subscription to DSH as an optional model provider via the official SDK, with selectable context variants, DSH tool execution, managed API key storage (CURSOR_API_KEY), and subscription usage under More → Settings → Cursor."
+  }
+}
