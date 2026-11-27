@@ -113,4 +113,76 @@ describe('host usage route', () => {
       else process.env.CURSOR_API_KEY = previous
     }
   })
+
+  it('propagates request cancellation, rate-limits rapid refresh=1, and hides unexpected error details', async () => {
+    const previousFetch = globalThis.fetch
+    let observedSignal
+    let upstreamCalls = 0
+    globalThis.fetch = async (url, init) => {
+      upstreamCalls += 1
+      observedSignal = init.signal
+      if (init.signal?.aborted) throw new DOMException('Aborted', 'AbortError')
+      if (String(url).endsWith('/auth/exchange_user_api_key')) {
+        return json({ accessToken: 'access_test' })
+      }
+      if (String(url).endsWith('/GetCurrentPeriodUsage')) {
+        return json({ billingCycleEnd: '1796694197000', planUsage: { totalPercentUsed: 12 } })
+      }
+      return json({ planInfo: { planName: 'Pro' } })
+    }
+    try {
+      const { route } = mount({ async resolve() { return { value: 'cursor_test' } } })
+
+      const abortedController = new AbortController()
+      abortedController.abort()
+      const cancelled = await route.fetch(new Request('http://dsh.local/api/dsh-simple-cursor/usage', {
+        signal: abortedController.signal,
+      }))
+      assert.equal(cancelled.status, 502)
+      const cancelledBody = await cancelled.json()
+      assert.equal(cancelledBody.error.code, 'USAGE_TIMEOUT')
+      assert.equal(upstreamCalls, 0)
+
+      const firstRefresh = await route.fetch(new Request('http://dsh.local/api/dsh-simple-cursor/usage?refresh=1'))
+      assert.equal(firstRefresh.status, 200)
+      assert.equal(observedSignal instanceof AbortSignal, true)
+      assert.equal(upstreamCalls, 3)
+
+      const secondRefresh = await route.fetch(new Request('http://dsh.local/api/dsh-simple-cursor/usage?refresh=1'))
+      assert.equal(secondRefresh.status, 429)
+      assert.equal(Number(secondRefresh.headers.get('retry-after')) >= 1, true)
+      const limitedBody = await secondRefresh.json()
+      assert.equal(limitedBody.error.code, 'RATE_LIMIT')
+      assert.equal(upstreamCalls, 3)
+
+      const { route: brokenRoute } = mount({
+        async resolve() {
+          throw Object.assign(new Error('raw internal secret_leak'), { code: 'INTERNAL_LEAK' })
+        },
+      })
+      const failed = await brokenRoute.fetch()
+      assert.equal(failed.status, 400)
+      const failedBody = await failed.json()
+      assert.equal(failedBody.error.code, 'MISSING_CREDENTIAL')
+      assert.equal(JSON.stringify(failedBody).includes('secret_leak'), false)
+    } finally {
+      globalThis.fetch = previousFetch
+    }
+  })
+
+  it('warns on startup when CURSOR_BACKEND_URL overrides the backend to localhost', () => {
+    const previousUrl = process.env.CURSOR_BACKEND_URL
+    const previousWarn = console.warn
+    const warnings = []
+    process.env.CURSOR_BACKEND_URL = 'http://localhost:8080'
+    console.warn = (msg) => warnings.push(String(msg))
+    try {
+      mount({ async resolve() { return undefined } })
+      assert.equal(warnings.some((item) => item.includes('CURSOR_BACKEND_URL') && item.includes('TLS')), true)
+    } finally {
+      console.warn = previousWarn
+      if (previousUrl === undefined) delete process.env.CURSOR_BACKEND_URL
+      else process.env.CURSOR_BACKEND_URL = previousUrl
+    }
+  })
 })

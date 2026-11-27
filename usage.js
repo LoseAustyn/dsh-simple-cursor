@@ -32,12 +32,14 @@ export class UsageFailure extends Error {
    * @param {string} message - safe message; never includes a credential.
    * @param {string} code - stable failure code.
    * @param {number | undefined} [status] - upstream HTTP status, when available.
+   * @param {number | undefined} [retryAfterSeconds] - suggested retry delay in seconds.
    */
-  constructor(message, code, status) {
+  constructor(message, code, status, retryAfterSeconds) {
     super(message)
     this.name = 'UsageFailure'
     this.code = code
     this.status = status
+    this.retryAfterSeconds = retryAfterSeconds
   }
 }
 
@@ -122,8 +124,9 @@ async function send(baseUrl, path, headers, fetchImpl, signal) {
       body: '{}',
       signal: combined,
     })
-  } catch (error) {
-    if (combined.aborted) throw new UsageFailure('Cursor usage request timed out or was cancelled', 'USAGE_TIMEOUT')
+  } catch {
+    if (signal?.aborted) throw new UsageFailure('Cursor usage request was cancelled', 'USAGE_TIMEOUT')
+    if (timeout.aborted) throw new UsageFailure('Cursor usage request timed out', 'USAGE_TIMEOUT')
     throw new UsageFailure('Could not reach the Cursor usage service', 'USAGE_UNAVAILABLE')
   }
 }
@@ -260,25 +263,107 @@ export async function fetchCursorUsage(apiKey, options = {}) {
 /**
  * Build a short-lived usage client so opening Settings repeatedly does not
  * hammer Cursor. The cache is keyed by a hash, never by the key itself.
- * @param {{ fetch?: typeof fetch, now?: () => number, ttlMs?: number }} [options] - injection seams.
- * @returns {{ load: (apiKey: string, signal?: AbortSignal) => Promise<object> }} cached loader.
+ * Concurrent requests for the same key share one upstream lookup while
+ * respecting each caller's abort signal.
+ * @param {{ fetch?: typeof fetch, now?: () => number, ttlMs?: number, minRefreshMs?: number }} [options] - injection seams.
+ * @returns {{ load: (apiKey: string, signal?: AbortSignal, force?: boolean) => Promise<object> }} cached loader.
  */
 export function createUsageClient(options = {}) {
   const fetchImpl = options.fetch ?? globalThis.fetch
   const now = options.now ?? Date.now
   const ttlMs = options.ttlMs ?? DEFAULT_CACHE_MS
+  const minRefreshMs = options.minRefreshMs ?? 0
   let cached
+  let inflight
+  let lastForce
 
   return {
     async load(apiKey, signal, force = false) {
+      if (signal?.aborted) {
+        throw new UsageFailure('Cursor usage request was cancelled', 'USAGE_TIMEOUT')
+      }
       const fingerprint = createHash('sha256').update(apiKey).digest('hex')
       const at = now()
       if (!force && cached !== undefined && cached.fingerprint === fingerprint && at - cached.at < ttlMs) {
         return cached.value
       }
-      const value = await fetchCursorUsage(apiKey, { fetch: fetchImpl, signal, now })
-      cached = { fingerprint, at: now(), value }
-      return value
+
+      let active = inflight !== undefined
+        && inflight.fingerprint === fingerprint
+        && !inflight.controller.signal.aborted
+        ? inflight
+        : undefined
+      if (active === undefined) {
+        if (force && minRefreshMs > 0 && lastForce !== undefined
+          && lastForce.fingerprint === fingerprint && at - lastForce.at < minRefreshMs) {
+          const retryAfterSeconds = Math.max(1, Math.ceil((minRefreshMs - (at - lastForce.at)) / 1000))
+          throw new UsageFailure(
+            'Please wait before refreshing Cursor usage again',
+            'RATE_LIMIT',
+            429,
+            retryAfterSeconds,
+          )
+        }
+        if (force) lastForce = { fingerprint, at }
+        const controller = new AbortController()
+        const entry = {
+          fingerprint,
+          controller,
+          callers: 0,
+          promise: null,
+        }
+        entry.promise = fetchCursorUsage(apiKey, { fetch: fetchImpl, signal: controller.signal, now })
+          .then((value) => {
+            cached = { fingerprint, at: now(), value }
+            return value
+          })
+          .finally(() => {
+            if (inflight === entry) inflight = undefined
+          })
+        inflight = entry
+        active = entry
+      }
+
+      active.callers += 1
+      try {
+        if (signal === undefined) return await active.promise
+        return await new Promise((resolve, reject) => {
+          let settled = false
+          const onAbort = () => {
+            if (settled) return
+            settled = true
+            active.callers -= 1
+            if (active.callers <= 0) {
+              if (inflight === active) inflight = undefined
+              active.controller.abort()
+            }
+            reject(new UsageFailure('Cursor usage request was cancelled', 'USAGE_TIMEOUT'))
+          }
+          if (signal.aborted) {
+            onAbort()
+            return
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+          active.promise.then(
+            (value) => {
+              if (settled) return
+              settled = true
+              active.callers -= 1
+              signal.removeEventListener('abort', onAbort)
+              resolve(value)
+            },
+            (error) => {
+              if (settled) return
+              settled = true
+              active.callers -= 1
+              signal.removeEventListener('abort', onAbort)
+              reject(error)
+            },
+          )
+        })
+      } finally {
+        if (signal === undefined) active.callers -= 1
+      }
     },
   }
 }

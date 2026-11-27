@@ -23,6 +23,7 @@ export const inject = ['llm']
  * @returns {void}
  */
 export function apply(ctx, config) {
+  warnUnsafeBackendEnv()
   const options = resolveConfig(config)
   const sdk = createSdkClient()
   const bridge = createBridge({
@@ -51,7 +52,7 @@ export function apply(ctx, config) {
   // Subscription usage is fetched on the Host, authenticated with the key from
   // the credentials store. The browser gets only normalized plan and meter
   // fields through the existing authenticated DSH API transport.
-  const usage = createUsageClient()
+  const usage = createUsageClient({ minRefreshMs: 3_000 })
   ctx.inject(['connection'], (connectionCtx) => {
     connectionCtx.effect(() => connectionCtx.connection.fetch.register({
       path: USAGE_ROUTE_PATH,
@@ -60,6 +61,7 @@ export function apply(ctx, config) {
       fetch: async (request) => {
         const force = request instanceof Request
           && new URL(request.url, 'http://dsh.local').searchParams.get('refresh') === '1'
+        const signal = request instanceof Request ? request.signal : undefined
         let apiKey
         try {
           apiKey = await resolveApiKey(ctx)
@@ -67,31 +69,74 @@ export function apply(ctx, config) {
           return usageResponse(error, 400)
         }
         try {
-          return Response.json({ ok: true, usage: await usage.load(apiKey, undefined, force) }, {
+          return Response.json({ ok: true, usage: await usage.load(apiKey, signal, force) }, {
             headers: { 'cache-control': 'no-store' },
           })
         } catch (error) {
-          const status = error instanceof UsageFailure && error.code === 'INVALID_CREDENTIAL' ? 400 : 502
-          return usageResponse(error, status)
+          if (error instanceof UsageFailure) {
+            const status = error.code === 'INVALID_CREDENTIAL'
+              ? 400
+              : error.code === 'RATE_LIMIT'
+                ? 429
+                : 502
+            const headers = error.retryAfterSeconds !== undefined
+              ? { 'retry-after': String(error.retryAfterSeconds) }
+              : undefined
+            return usageResponse(error, status, headers)
+          }
+          return usageResponse(error, 502)
         }
       },
     }), 'dsh-simple-cursor: subscription usage')
   })
 }
 
+/**
+ * Warn once at startup if `CURSOR_BACKEND_URL` is set, especially when pointing
+ * at localhost/non-HTTPS because `@cursor/sdk` sets `NODE_TLS_REJECT_UNAUTHORIZED="0"`
+ * globally for the entire Node process on localhost backend URLs.
+ * @returns {void}
+ */
+function warnUnsafeBackendEnv() {
+  const raw = process.env.CURSOR_BACKEND_URL
+  if (typeof raw !== 'string' || raw.trim().length === 0) return
+  let localOrInsecure = false
+  try {
+    const parsed = new URL(raw.trim())
+    const host = parsed.hostname.toLowerCase()
+    localOrInsecure = parsed.protocol !== 'https:'
+      || host === 'localhost'
+      || host === '127.0.0.1'
+      || host === '[::1]'
+      || host === '::1'
+  } catch {
+    localOrInsecure = true
+  }
+  if (localOrInsecure) {
+    console.warn('[dsh-simple-cursor] CURSOR_BACKEND_URL points to a local or non-HTTPS endpoint; @cursor/sdk disables process-wide TLS verification for localhost URLs')
+  } else {
+    console.warn('[dsh-simple-cursor] CURSOR_BACKEND_URL is set; Cursor requests will target the overridden backend')
+  }
+}
 
 /**
  * @param {unknown} error - credential or usage failure.
  * @param {number} status - response status.
+ * @param {Record<string, string>} [extraHeaders] - optional response headers.
  * @returns {Response} safe JSON failure.
  */
-function usageResponse(error, status) {
+function usageResponse(error, status, extraHeaders) {
   const known = error instanceof UsageFailure
-  const fallbackCode = status === 400 ? 'INVALID_CREDENTIAL' : 'USAGE_UNAVAILABLE'
-  const code = typeof error?.code === 'string' && error.code.length > 0
+    || (error instanceof LlmError && (error.code === 'MISSING_CREDENTIAL' || error.code === 'INVALID_CREDENTIAL'))
+  const fallbackCode = status === 400
+    ? 'INVALID_CREDENTIAL'
+    : status === 429
+      ? 'RATE_LIMIT'
+      : 'USAGE_UNAVAILABLE'
+  const code = known && typeof error.code === 'string' && error.code.length > 0
     ? error.code
     : fallbackCode
-  const message = error instanceof Error && error.message.length > 0
+  const message = known && error.message.length > 0
     ? error.message
     : 'Cursor usage lookup failed'
   return Response.json({
@@ -99,7 +144,10 @@ function usageResponse(error, status) {
     error: { code, message },
   }, {
     status,
-    headers: { 'cache-control': 'no-store' },
+    headers: {
+      'cache-control': 'no-store',
+      ...extraHeaders,
+    },
   })
 }
 /**

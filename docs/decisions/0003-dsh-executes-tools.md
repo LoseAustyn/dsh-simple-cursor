@@ -19,19 +19,25 @@ Cursor 的本地 agent 默认带有文件读写、终端命令、网页搜索等
 
 ```js
 tools: ['mcp'],
-local: { cwd, settingSources: [] },
+local: {
+  cwd,
+  settingSources: [],
+  fs: emptyFs(),
+  store: createInMemoryStore(sdk),
+},
 ```
 
-- `tools: ['mcp']` 仅保留自定义工具通道，彻底关闭 Cursor 内置的文件、终端与网页工具。
-- `settingSources: []` 禁止读取项目级与用户级 MCP 配置或环境规则。
+- `tools: ['mcp']` 仅保留自定义工具通道，由 Cursor 后端按 `x-cursor-agent-allowed-tools` 限制可用工具集（对后端行为的信任假设）。
+- `local.fs: emptyFs()` 作为客户端侧纵深防御：SDK 不注册宿主 `Shell`、`ReadLints`、`SemanticSearch`、`applyAgentDiff`、`recordScreen` 与 `computerUse` 执行器，文件类内置执行器被限制在空的只读内存虚拟树上，同时阻断宿主 Git 状态上报。
+- `settingSources: []` 禁止读取项目级与用户级 MCP 配置、Hooks 或环境规则。
 - 每次调用 `agent.send()` 时，仅将当次 DSH 请求传入的工具（`name`、`description`、`parameters`）注册为自定义工具；其 `execute` 回调只负责挂起请求并把参数传回 `bridge`，等 DSH 执行完毕后在下一轮按 `toolCallId` 回填结果。
 
 ## 影响
 
-- Cursor 无法在本机直接读写工作区、执行 Shell 命令或访问网络，所有实际操作均受 DSH 的权限策略与用户审批约束。
-- 会话中仅会出现 DSH 显式下发的工具，不会混入 Cursor 内置工具或外部隐式 MCP 工具。
+- 工具允许列表的第一道强制点在 Cursor 后端，而客户端侧通过 `emptyFs()` 与 `settingSources: []` 确保即便后端违约下发内置工具，也无法直接触及宿主工作区或启动默认 Shell。
+- 会话中仅会出现 DSH 显式下发的工具，不会混入 Cursor 内置工具或外部隐式 MCP 工具，所有实际操作均受 DSH 的权限策略与用户审批约束。
 - 若未来确需评估开放某类 Cursor 原生工具，必须作为独立的安全架构变更重新评审审批与沙箱方案。
-- 单元测试需长期保留对 `tools: ['mcp']` 与 `settingSources: []` 的精确断言，防止重构时意外放宽。
+- 单元测试需长期保留对 `tools: ['mcp']`、`settingSources: []` 以及 `fs` / `store` 透传的精确断言，防止重构时意外放宽。
 
 ## 备选方案
 

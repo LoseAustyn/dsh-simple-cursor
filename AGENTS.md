@@ -27,9 +27,9 @@ node --test --test-name-pattern 'tool' tests/bridge.test.mjs
 
 - **插件标识一致**：包名 `dsh-simple-cursor`、patch 行 ID `simple-cursor`、模块加载器 ID `dsh-simple-cursor`、提供方路由 `cursor`、locale 命名空间 `simpleCursor`、设置页分区 ID `simple-cursor`、凭证引用名 `CURSOR_API_KEY`、用量路由 `/api/dsh-simple-cursor/usage`。改动其中任意一项都必须同步其余各处并重新安装。
 - **凭证单一来源**：插件代码只从 `ctx.credentials.resolve('CURSOR_API_KEY')` 读取密钥，不直接读取环境变量、profile 配置或 `~/.cursor/sdk/auth.json`。DSH `credentials` 服务自身的来源优先级（托管文件、环境变量、`.env`）由宿主决定，设置页状态栏通过 `source` 展示当前来源。浏览器端只写不读，`describe` 仅返回 `configured`、`source`、`writable` 与 `masked`；更新密钥后在下一次模型请求时立即生效。
-- **工具执行边界**：只将 DSH 传入的自定义工具注册到 SDK 的 `mcp` 组，固定配置 `tools: ['mcp']` 与 `settingSources: []`，不得放宽。工具统一交由 DSH 执行，插件自身不启用也不执行文件、终端或网页工具。
-- **会话级 Agent 隔离**：每个 `sessionKey` 同时最多运行一个请求；主对话 `session:<id>` 与后台辅助请求 `purpose:<id>:<purpose>` 严格隔离，绝不共用 agent。遇到历史前缀不一致、切换模型或密钥、或上一轮工具调用未正常收尾时，一律销毁旧实例并新建 agent；插件卸载时释放全部实例。
-- **流式输出契约**：`usage` 分块必须在 `finish` 之前发出，`finish` 之后不得再产生任何分块；工具调用的 `arguments` 必须为原始 JSON 字符串；全程响应 `options.signal` 取消信号；异常统一映射为稳定的 `LlmError` 错误码。
+- **工具执行与状态边界**：只将 DSH 传入的自定义工具注册到 SDK 的 `mcp` 组，固定配置 `tools: ['mcp']`、`settingSources: []`、`fs: emptyFs()` 与内存 `LocalAgentStore`，不得放宽。工具统一交由 DSH 执行，插件自身不启用也不执行文件、终端或网页工具，并在释放 agent 时清理对应 `agent-transcripts`。
+- **会话级 Agent 隔离**：每个 `sessionKey`（对 `sessionId` 与 `purpose` 进行 `encodeURIComponent` 转义）同时最多运行一个请求；主对话 `session:<id>` 与后台辅助请求 `purpose:<id>:<purpose>` 严格隔离，绝不共用 agent。槽位仅保存密钥 `sha256` 指纹，遇到历史前缀不一致、切换模型或密钥、空闲/挂起超时或中止时，一律销毁旧实例。
+- **流式输出契约**：`usage` 分块必须在 `finish` 之前发出，`finish` 之后不得再产生任何分块；工具调用的 `arguments` 必须为原始 JSON 字符串；全程响应 `options.signal` 取消信号；队列与挂起工具均有界限与超时限制；异常经脱敏后统一映射为稳定的 `LlmError` 错误码。
 - **调用参数校验**：普通对话若传入 `temperature`、`maxTokens` 或非空 `stop`，直接抛出 `UNSUPPORTED_OPTION`；带非空 `purpose` 的辅助请求（如生成会话标题、上下文压缩）按 Cursor 默认参数放行，忽略这些字段。
 - **上下文容量优先取真实档位**：模型目录提供 `context` 参数时，按所选变体的真实容量上报给 DSH；仅当目录未提供该参数时，才使用 `contextWindow` 兜底值（默认 `128000`）。`::context=` 仅作 DSH 模型选择器的内部拼接标识，发往 Cursor SDK 前必须还原为真实模型 ID 与变体参数。
 - **订阅用量脱敏**：由服务端使用已存密钥换取短期令牌并请求用量接口，按密钥 SHA-256 哈希缓存 30 秒（`refresh=1` 跳过缓存）；返回给浏览器的响应仅包含归一化后的百分比与额度字段，绝不回传 API Key、短期令牌或上游原始报文。
@@ -69,7 +69,7 @@ node --test --test-name-pattern 'tool' tests/bridge.test.mjs
 | `bridge`、`transcript`、`chunks`、`queue`、工具往返、取消 | `docs/ARCHITECTURE.md`、`docs/SECURITY.md` | `tests/bridge.test.mjs`、`tests/transcript.test.mjs`、`tests/support.test.mjs` | 重装触发重载或重启 DSH；实测带 DSH 工具调用的多轮对话、中途取消与空响应提示 |
 | 凭证读取、设置页保存与清除 | `docs/SECURITY.md` | `tests/adapter.test.mjs`、`tests/client.test.mjs`、`tests/index.test.mjs` | 刷新页面；验证保存/清除在下一次模型请求生效，且响应中不含密钥明文 |
 | 用量路由、`usage.js`、用量面板 UI | `docs/SECURITY.md` | `tests/usage.test.mjs`、`tests/index.test.mjs`、`tests/client.test.mjs` | 重装触发重载或重启 DSH；验证设置页用量展示、手动刷新及脱敏响应 |
-| `sdk.js`、SDK 升级、本地 agent 参数 | `docs/SECURITY.md` | `tests/support.test.mjs`、`tests/bridge.test.mjs` | 重装触发重载或重启 DSH；验证新建 agent 正常且工具仍完全由 DSH 执行 |
+| `sdk.js`、SDK 升级、本地 agent 参数 | `docs/SECURITY.md` | `tests/support.test.mjs`、`tests/bridge.test.mjs` | 升级前核对 `StatsigClient` 禁用遥测/外连、`local.store` / `local.fs` / `agent-transcripts` 行为与原生二进制包变更；重装触发重载或重启 DSH；验证新建 agent 正常且工具仍完全由 DSH 执行 |
 | `package.json`、`cordis.patch.yml`、`dsh.client.inject`、`files` | `docs/DEVELOPMENT.md` | `npm run check:pack` | `remove_bundle` → `install_bundle` 并刷新页面（`files` 仅影响打包产物，`link:` 安装不会自动过滤目录）；确认 `applied` 且 `warnings=[]` |
 | `locale/*.json`、`icon.svg` | `docs/DEVELOPMENT.md` | `npm run check:pack` | `link:` 安装直接刷新页面（必要时强制刷新），打包安装需重装；核对中英文插件详情页标题、简介与图标 |
 | 仅文档 / 测试 | 对应文档 | 受影响的检查命令 | 无需重载运行环境 |

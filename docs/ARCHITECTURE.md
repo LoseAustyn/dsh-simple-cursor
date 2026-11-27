@@ -21,7 +21,7 @@ DSH Agent / LLM 运行时
             ├── sessionKey    → 按会话与用途隔离本地 agent 实例
             ├── transcript.js → 历史指纹计算、续接分类、请求拼装
             ├── sdk.js        → @cursor/sdk Agent.create / agent.send
-            │     └── tools: ["mcp"], settingSources: []
+            │     └── tools: ["mcp"], settingSources: [], fs: emptyFs(), 内存 store
             ├── queue.js + chunks.js → 组装 DSH StreamChunk
             └── 工具调用挂起（park）→ 交由 DSH 执行 → 下一轮请求恢复同一次运行
 
@@ -102,9 +102,10 @@ purpose:<sessionId>:<purpose>       # 后台辅助请求（会话标题、上下
 ```
 
 - 普通主对话与后台辅助请求严格隔离，绝不共用本地 agent。
-- 不同 DSH 会话之间互不共享本地 agent。
+- 不同 DSH 会话之间互不共享本地 agent；`sessionKey` 对 `sessionId` 与 `purpose` 使用 `encodeURIComponent` 编码，避免分隔符碰撞。
 - 同一槽位同一时刻只允许一个运行中请求，并发调用直接报错，不做隐式排队。
-- 本地 agent 仅驻留进程内存，宿主重启或插件重载后自动从 `fresh` 重新开始，不向 DSH 会话日志写入私有状态。
+- 会话槽位仅保存密钥 `sha256` 指纹用于轮换比对；处于 `holding` 或 `idle` 状态的槽位支持空闲超时回收（默认 15 分钟），`holding` 阶段同时监听取消信号并在中止时立即销毁释放。
+- 本地 agent 的状态存储通过自定义内存 `LocalAgentStore` 保持在进程内存中（不落盘 SQLite）；SDK 运行期产生的单 agent 转录文件在 `dispose()` 时按 `agentId` 自动清理，宿主重启或插件重载后自动从 `fresh` 重新开始，不向 DSH 会话日志写入私有状态。
 
 ### 历史指纹与续接判定
 
@@ -236,5 +237,5 @@ API Key 唯一读取路径为 `ctx.credentials.resolve('CURSOR_API_KEY')`：
 - 不使用 Cursor 云端虚拟机，仅在本机运行本地 agent。
 - 不启用 Cursor 内置文件、终端或网页工具，工具执行权始终留在 DSH。
 - 不向浏览器暴露原始模型目录报文、上游用量原始响应、API Key 或短期访问令牌。
-- 不自建独立鉴权、限流或跨用户隔离机制，统一复用 DSH 的 `connection` 与 `credentials` 基础设施。
-- 不做跨进程或持久化会话恢复，本地 agent 仅保存在当前进程内存中。
+- 不自建独立鉴权机制，统一复用 DSH 的 `connection` 与 `credentials` 基础设施（用量接口的 `refresh=1` 在服务端受最小间隔冷却保护）。
+- 不做跨进程或持久化会话恢复，本地 agent 状态通过内存 `LocalAgentStore` 保存，运行期产生的单 agent 转录文件在释放时自动清理。

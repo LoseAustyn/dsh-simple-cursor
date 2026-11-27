@@ -168,4 +168,57 @@ describe('subscription usage', () => {
     assert.equal(result.plan.name, null)
     assert.equal(result.fetchedAt, '1970-01-01T00:00:00.000Z')
   })
+
+  it('deduplicates concurrent in-flight usage lookups and respects caller abort signals', async () => {
+    let exchangeCalls = 0
+    let releaseExchange
+    const gate = new Promise((resolve) => { releaseExchange = resolve })
+    const request = async (url, init) => {
+      if (String(url).endsWith('/auth/exchange_user_api_key')) {
+        exchangeCalls += 1
+        await gate
+        if (init.signal.aborted) throw new DOMException('Aborted', 'AbortError')
+        return json({ accessToken: 'access_test' })
+      }
+      if (String(url).endsWith('/GetCurrentPeriodUsage')) {
+        return json({ billingCycleEnd: '1796694197000', planUsage: { totalPercentUsed: 10 } })
+      }
+      return json({ planInfo: { planName: 'Pro' } })
+    }
+    const client = createUsageClient({ fetch: request, minRefreshMs: 3000 })
+    const c1 = new AbortController()
+    const c2 = new AbortController()
+    const p1 = client.load('cursor_test', c1.signal)
+    const p2 = client.load('cursor_test', c2.signal)
+    assert.equal(exchangeCalls, 1)
+
+    c1.abort()
+    await assert.rejects(p1, (error) => error instanceof UsageFailure && error.code === 'USAGE_TIMEOUT')
+    releaseExchange()
+    const usage = await p2
+    assert.equal(usage.usage.totalPercent, 10)
+    assert.equal(exchangeCalls, 1)
+  })
+
+  it('enforces a minimum interval between forced refreshes', async () => {
+    const { calls, request } = fixture()
+    let now = 1000
+    const client = createUsageClient({ fetch: request, now: () => now, minRefreshMs: 3000 })
+    await client.load('cursor_test', undefined, true)
+    assert.equal(calls.length, 3)
+
+    now = 2500
+    await assert.rejects(
+      client.load('cursor_test', undefined, true),
+      (error) => error instanceof UsageFailure
+        && error.code === 'RATE_LIMIT'
+        && error.status === 429
+        && error.retryAfterSeconds === 2,
+    )
+    assert.equal(calls.length, 3)
+
+    now = 4500
+    await client.load('cursor_test', undefined, true)
+    assert.equal(calls.length, 6)
+  })
 })

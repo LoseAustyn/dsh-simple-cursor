@@ -1,6 +1,6 @@
 {
   "name": "dsh-simple-cursor",
-  "version": "0.2.1",
+  "version": "1.0.0",
   "private": true,
   "description": "Simple Cursor: a third-party DSH plugin that uses a Cursor subscription as a model provider through the official Cursor SDK. Not affiliated with Cursor.",
   "license": "MIT",

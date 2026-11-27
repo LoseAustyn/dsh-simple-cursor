@@ -9,7 +9,7 @@ import {
   FALLBACK_MODELS, contextOf, contextTokensOf, createCatalog, modelRouteOf, modelSelection, reasoningOf, toModelInfo, toModelInfos,
 } from './catalog.js'
 import { CREDENTIAL_REF, PROVIDER_NAME, rejectedCallOption } from './config.js'
-import { BridgeFailure, failureFromUnknown } from './errors.js'
+import { BridgeFailure, failureFromUnknown, sanitizeErrorMessage } from './errors.js'
 
 export class CursorAdapter extends LlmAdapter {
   /**
@@ -128,8 +128,9 @@ export class CursorAdapter extends LlmAdapter {
   warnOnce(error) {
     if (this.warned) return
     this.warned = true
-    const message = error instanceof Error ? error.message : String(error)
-    console.warn(`[dsh-simple-cursor] model list unavailable: ${message}`)
+    const raw = error instanceof Error ? error.message : String(error)
+    const safe = sanitizeErrorMessage(raw, 'catalog lookup failed')
+    console.warn(`[dsh-simple-cursor] model list unavailable: ${safe}`)
   }
 }
 

@@ -5,10 +5,10 @@
 ## 凭证管理
 
 - [ ] 唯一密钥读取入口为 `ctx.credentials.resolve('CURSOR_API_KEY')`，未新增 `process.env`、配置字段、`.env` 或 SDK 登录文件回退。
-- [ ] `Config` Schema 仅包含 `cwd` 与 `contextWindow`；`resolveConfig` 仍明确拒绝 `apiKey`、`apiKeyEnv` 等未知字段。
-- [ ] 每次模型请求动态重新解析密钥，不在适配器内缓存明文；检测到密钥变更时自动销毁旧 agent。
-- [ ] 浏览器端只调用 `credentials.describe` / `set` / `unset`；`describe` 不返回密钥明文；保存成功后立即清空输入框草稿。
-- [ ] 错误信息、终端日志与 HTTP 响应中均不出现完整密钥或短期访问令牌。
+- [ ] `Config` Schema 仅包含 `cwd` 与 `contextWindow`；`resolveConfig` 仍明确拒绝 `apiKey`、`apiKeyEnv` 等未知字段，并拒绝符号链接、非当前用户目录、系统目录及敏感凭证目录。
+- [ ] 每次模型请求动态重新解析密钥，不在适配器或会话槽位中长期保存明文（`bridge` 仅存密钥 `sha256` 指纹）；检测到指纹变更时自动销毁旧 agent。
+- [ ] 浏览器端只调用 `credentials.describe` / `set` / `unset`；`describe` 不返回密钥明文；保存成功后立即清空输入框草稿；卸载时中止未完成用量请求并校验响应代际号。
+- [ ] 错误信息（`sanitizeErrorMessage`）、终端日志与 HTTP 响应中均不出现完整密钥、Bearer 令牌或短期访问令牌。
 - [ ] `credentials` 服务缺失或未配置密钥时统一抛出 `MISSING_CREDENTIAL`，绝不降级读取其他来源。
 
 ## 订阅用量路由
@@ -18,34 +18,34 @@
 - [ ] 宿主缺少 `connection` 服务时不挂载该路由；设置页用量区给出明确不可用提示，但模型提供方本身仍可正常工作。
 - [ ] 仅接受 `GET` 请求，`requestBody: 'buffered'`，查询参数仅读取 `refresh=1`。
 - [ ] 所有响应携带 `cache-control: no-store`，仅返回归一化后的安全字段，不透传上游原始 JSON。
-- [ ] 失败响应只返回 `{ code, message }`：`resolveApiKey` 失败返回 `400`；上游 `401`/`403` 映射为 `INVALID_CREDENTIAL`（`400`），其余上游异常返回 `502`。
-- [ ] 内存缓存以 `sha256(apiKey)` 为键，不保存密钥原文、不落盘；`force=true` 可跳过缓存。
-- [ ] 单次上游请求设 15 秒超时，网络或超时错误统一归类为 `USAGE_TIMEOUT` 或 `USAGE_UNAVAILABLE`。
+- [ ] 失败响应只返回 `{ code, message }`：`resolveApiKey` 失败返回 `400`；上游 `401`/`403` 映射为 `INVALID_CREDENTIAL`（`400`）；`?refresh=1` 超出冷却返回 `429` + `Retry-After`；未知异常不泄露内部细节（返回 `502` 固定提示）。
+- [ ] 内存缓存以 `sha256(apiKey)` 为键，并发查询去重且各自响应调用方 `AbortSignal`；`force=true` 可跳过缓存但受最小冷却间隔保护。
+- [ ] 单次上游请求设 15 秒超时，超时的归类为 `USAGE_TIMEOUT`，调用方中止透传 `ABORTED`，其余网络错误归类为 `USAGE_UNAVAILABLE`。
 
-## 工具执行边界
+## 工具执行与本地状态边界
 
-- [ ] `localAgentOptions()` 固定保持 `tools: ['mcp']` 与 `settingSources: []`。
+- [ ] `localAgentOptions()` 固定保持 `tools: ['mcp']` 与 `settingSources: []`，且实际创建 agent 时传入 `fs: emptyFs()` 与内存 `LocalAgentStore`。
 - [ ] 自定义工具仅由当次 DSH 请求的 `name`、`description`、`parameters` 映射生成，无本地隐式注入。
 - [ ] 自定义工具的 `execute` 仅将调用挂起交给 `bridge`，插件自身不执行文件读写、终端命令或网页抓取。
-- [ ] 工具执行结果严格按 `toolCallId` 匹配；若待决集合不一致，`classify` 自动回退为 `fresh` 重建实例；并发请求或非法工具名直接报 `INVALID_REQUEST`。
-- [ ] 未启用任何 Cursor 内置工具，也未加载项目级或用户级 MCP 配置。
+- [ ] 工具执行结果严格按 `toolCallId` 匹配；重复 `toolCallId` 明确拒绝（`INVALID_REQUEST`）；超出单轮挂起上限或等待超时一律 fail-closed 并销毁会话；若待决集合不一致，`classify` 自动回退为 `fresh` 重建实例；并发请求或非法工具名直接报 `INVALID_REQUEST`。
+- [ ] 未启用任何 Cursor 内置工具，也未加载项目级或用户级 MCP 配置；释放 agent 时按 `agentId` 清理对应 `agent-transcripts`。
 
-## 流式输出契约
+## 流式输出与队列契约
 
 - [ ] `usage` 分块位于 `finish` 之前，`finish` 发出后不再产出任何分块。
 - [ ] 每个 `block-start` 均有配对的 `block-end`，同一内容块的增量分块复用同一个 `index`。
 - [ ] 工具调用的 `arguments` 与 `argumentsDelta` 均为原始 JSON 字符串。
 - [ ] 工具轮次结束时仅发出 `finish { kind: 'tool-calls' }`，整次 Cursor 运行真正结束时再上报 `usage`。
-- [ ] 空回复映射为 `EMPTY_RESPONSE`，取消映射为 `ABORTED`，未归类传输失败映射为 `TRANSPORT`。
-- [ ] `options.signal` 全链路透传至队列与附件读取；触发取消时立即终止当前运行并释放会话槽位。
+- [ ] 空回复映射为 `EMPTY_RESPONSE`，取消映射为 `ABORTED`，未归类传输失败映射为 `TRANSPORT`（`queue` 达到容量上限时 fail-closed）。
+- [ ] `options.signal` 全链路透传至队列、挂起阶段（`holding`）与附件读取；触发取消时立即终止当前运行并释放会话槽位。
 
 ## 会话与本地 Agent
 
-- [ ] `sessionKey` 将普通主对话与带 `purpose` 的辅助请求严格隔离，不同会话之间不共用实例。
+- [ ] `sessionKey` 对 `sessionId` 与 `purpose` 进行 `encodeURIComponent` 转义，将普通主对话与带 `purpose` 的辅助请求严格隔离，不同会话之间不共用实例。
 - [ ] 同一 `sessionKey` 同时最多存在一个运行中请求，并发调用直接返回 `INVALID_REQUEST`。
 - [ ] 历史前缀不一致走 `fresh` 重建，匹配待决工具结果走 `tools` 恢复，纯新增用户侧消息走 `follow-up` 增量发送。
 - [ ] `fresh` 将完整对话渲染为单条用户消息发送，`follow-up` 仅发送新增后缀。
-- [ ] `drop()` 确保取消运行、销毁 agent、拒绝所有挂起的工具回调并从会话表中移除。
+- [ ] `drop()` 确保取消运行、销毁 agent、拒绝所有挂起的工具回调、清理单 agent 转录目录并从会话表中移除；空闲/挂起会话超过 `sessionTtlMs` 自动回收。
 - [ ] 插件卸载清理回调会调用 `bridge.dispose()` 释放全部存活实例。
 
 ## 模型目录与上下文容量

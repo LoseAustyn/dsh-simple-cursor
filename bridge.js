@@ -6,22 +6,64 @@
  * agent and sends the current transcript to a new one.
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import fsp from 'node:fs/promises'
 
 import { createBlockWriter, finishStop, finishToolCalls } from './chunks.js'
-import { failure, failureFromUnknown } from './errors.js'
+import { defaultCwd } from './config.js'
+import { failure, failureFromUnknown, sanitizeErrorMessage } from './errors.js'
 import { createQueue } from './queue.js'
 import { canonicalMessages, classify, renderTranscript, toolResultPayload, withSystemPrompt } from './transcript.js'
 
 /** Quiet period that collects one parallel custom-tool batch, in milliseconds. */
 export const TOOL_BATCH_MS = 30
 
+/** Maximum parked custom-tool calls allowed in a single run. */
+export const MAX_PENDING_TOOLS = 128
+
+/** Default timeout for a parked tool call waiting on DSH, in milliseconds. */
+export const DEFAULT_TOOL_TIMEOUT_MS = 10 * 60_000
+
+/** Default idle/holding lifetime before an abandoned session is dropped. */
+export const DEFAULT_SESSION_TTL_MS = 15 * 60_000
+
+/**
+ * @param {string | undefined} apiKey - credential value.
+ * @returns {string | undefined} SHA-256 fingerprint for rotation detection.
+ */
+function fingerprintKey(apiKey) {
+  if (typeof apiKey !== 'string') return undefined
+  return createHash('sha256').update(apiKey).digest('hex')
+}
+
+/**
+ * Ensure `cwd` exists with restrictive permissions (`0700`), is owned by the
+ * current user, and is not a symbolic link.
+ * @param {string} cwd - local agent working directory.
+ * @returns {Promise<void>}
+ */
+async function ensureCwd(cwd) {
+  await fsp.mkdir(cwd, { recursive: true, mode: 0o700 })
+  const stat = await fsp.lstat(cwd)
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw failure('dsh-simple-cursor: cwd must be a directory and not a symbolic link', 'INVALID_REQUEST')
+  }
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw failure('dsh-simple-cursor: cwd must be owned by the current user', 'INVALID_REQUEST')
+  }
+  if (cwd === defaultCwd() && (stat.mode & 0o077) !== 0) {
+    await fsp.chmod(cwd, 0o700)
+  }
+}
+
 /**
  * @param {{
  *   client: { createAgent: (options: object) => Promise<object> },
  *   cwd: string,
  *   defer?: (fn: () => void) => () => void,
+ *   toolTimeoutMs?: number,
+ *   sessionTtlMs?: number,
+ *   maxPendingTools?: number,
  * }} options - SDK client, agent directory, and tool-batch scheduler.
  * @returns {{ stream: (request: object, extras: object) => AsyncGenerator<object>, dispose: () => Promise<void> }} bridge.
  */
@@ -30,8 +72,50 @@ export function createBridge(options) {
     const timer = setTimeout(fn, TOOL_BATCH_MS)
     return () => clearTimeout(timer)
   })
+  const toolTimeoutMs = options.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS
+  const sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS
+  const maxPendingTools = options.maxPendingTools ?? MAX_PENDING_TOOLS
   /** @type {Map<string, object>} */
   const sessions = new Map()
+
+  /**
+   * @param {object} session - live session.
+   * @returns {void}
+   */
+  function clearHolders(session) {
+    session.clearAbort?.()
+    session.clearAbort = undefined
+    session.clearIdle?.()
+    session.clearIdle = undefined
+  }
+
+  /**
+   * @param {object} session - live session in `holding` or `idle`.
+   * @param {AbortSignal | undefined} signal - request cancellation while holding.
+   * @returns {void}
+   */
+  function armIdle(session, signal) {
+    clearHolders(session)
+    if (session.closed) return
+    if (session.phase === 'holding' && signal !== undefined) {
+      if (signal.aborted) {
+        void drop(session)
+        return
+      }
+      const onAbort = () => {
+        void drop(session)
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      session.clearAbort = () => signal.removeEventListener('abort', onAbort)
+    }
+    if (Number.isFinite(sessionTtlMs) && sessionTtlMs > 0) {
+      const timer = setTimeout(() => {
+        void drop(session)
+      }, sessionTtlMs)
+      timer.unref?.()
+      session.clearIdle = () => clearTimeout(timer)
+    }
+  }
 
   /**
    * @param {object} session - live session.
@@ -42,6 +126,7 @@ export function createBridge(options) {
     session.closed = true
     session.phase = 'closed'
     session.cancelTimer?.()
+    clearHolders(session)
     session.queue.fail(failure('Cursor session closed', 'ABORTED'))
     for (const parked of session.pending.values()) parked.reject(failure('Cursor session closed', 'ABORTED'))
     session.pending.clear()
@@ -66,8 +151,20 @@ export function createBridge(options) {
    * @returns {Promise<unknown>} result DSH supplies on the next request.
    */
   function parkTool(session, call) {
-    const id = typeof call.id === 'string' && call.id.length > 0 ? call.id : randomUUID()
+    const hasExplicitId = typeof call.id === 'string' && call.id.length > 0
+    const id = hasExplicitId ? call.id : randomUUID()
+    if (hasExplicitId && session.pending.has(id)) {
+      const duplicate = failure(`dsh-simple-cursor: duplicate tool call id "${id}"`, 'INVALID_REQUEST')
+      session.queue.fail(duplicate)
+      return Promise.reject(duplicate)
+    }
+    if (session.pending.size >= maxPendingTools) {
+      const overflow = failure('dsh-simple-cursor: too many pending tool calls in one run', 'INVALID_REQUEST')
+      session.queue.fail(overflow)
+      return Promise.reject(overflow)
+    }
     let settled = false
+    let timer
     /** @type {(value: unknown) => void} */
     let resolve
     /** @type {(error: Error) => void} */
@@ -76,18 +173,34 @@ export function createBridge(options) {
       resolve = res
       reject = rej
     })
-    session.pending.set(id, {
+    const clearTimer = () => {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+    }
+    const entry = {
       resolve: (value) => {
         if (settled) return
         settled = true
+        clearTimer()
         resolve(value)
       },
       reject: (error) => {
         if (settled) return
         settled = true
+        clearTimer()
         reject(error)
       },
-    })
+    }
+    if (Number.isFinite(toolTimeoutMs) && toolTimeoutMs > 0) {
+      timer = setTimeout(() => {
+        entry.reject(failure('dsh-simple-cursor: tool call timed out waiting for result', 'ABORTED'))
+        void drop(session)
+      }, toolTimeoutMs)
+      timer.unref?.()
+    }
+    session.pending.set(id, entry)
     session.queue.push({ type: 'tool', call: { id, name: call.name, args: call.args ?? {} } })
     session.cancelTimer?.()
     session.cancelTimer = defer(() => {
@@ -138,7 +251,7 @@ export function createBridge(options) {
    * @returns {Promise<object>} session whose run has started.
    */
   async function open(key, request, extras) {
-    await fsp.mkdir(options.cwd, { recursive: true })
+    await ensureCwd(options.cwd)
     const agent = await options.client.createAgent({
       apiKey: extras.apiKey,
       model: extras.model,
@@ -151,7 +264,7 @@ export function createBridge(options) {
       seen: [],
       phase: 'running',
       modelId: request.model,
-      apiKey: extras.apiKey,
+      apiKeyFingerprint: fingerprintKey(extras.apiKey),
       requestMessages: request.messages,
       closed: false,
     }
@@ -205,12 +318,13 @@ export function createBridge(options) {
         yield* finishToolCalls()
         session.phase = 'holding'
         session.seen = canonicalMessages(session.requestMessages)
+        armIdle(session, signal)
         return
       } else if (event?.type === 'done') {
         session.cancelTimer?.()
         const result = event.result ?? {}
         if (result.status === 'error') {
-          throw failure(result.error?.message || 'Cursor run failed', 'TRANSPORT')
+          throw failure(sanitizeErrorMessage(result.error?.message, 'Cursor run failed'), 'TRANSPORT')
         }
         if (result.status === 'cancelled') throw failure('Cursor run cancelled', 'ABORTED')
         if (buffered.length > 0) {
@@ -238,6 +352,7 @@ export function createBridge(options) {
           ...canonicalMessages(session.requestMessages),
           ...canonicalMessages([{ role: 'assistant', content: writer.blocks() }]),
         ]
+        armIdle(session, undefined)
         return
       } else {
         throw failure('Cursor stream closed', 'STREAM_CLOSED')
@@ -259,18 +374,21 @@ export function createBridge(options) {
         throw failure('dsh-simple-cursor: this session already has a Cursor run in progress', 'INVALID_REQUEST')
       }
       const pendingIds = new Set(session?.pending?.keys() ?? [])
-      let plan = session === undefined || session.stale === true || session.modelId !== request.model || session.apiKey !== extras.apiKey
+      const apiKeyFingerprint = fingerprintKey(extras.apiKey)
+      let plan = session === undefined || session.stale === true || session.modelId !== request.model || session.apiKeyFingerprint !== apiKeyFingerprint
         ? { kind: 'fresh' }
         : classify(session.seen, request.messages ?? [], pendingIds)
       if (plan.kind === 'tools' && session.phase !== 'holding') plan = { kind: 'fresh' }
       if (plan.kind === 'follow-up' && session.phase !== 'idle') plan = { kind: 'fresh' }
       try {
         if (plan.kind === 'tools') {
+          clearHolders(session)
           session.requestMessages = request.messages
           session.phase = 'running'
           await resolveTools(session, request, extras)
           yield* consume(session, request.signal)
         } else if (plan.kind === 'follow-up') {
+          clearHolders(session)
           session.requestMessages = request.messages
           session.phase = 'running'
           await start(session, plan.messages, request, extras)
@@ -287,6 +405,10 @@ export function createBridge(options) {
       } catch (error) {
         if (session !== undefined && sessions.get(key) === session) await drop(session)
         throw failureFromUnknown(error, extras.apiKey !== undefined)
+      } finally {
+        if (session !== undefined && session.phase === 'running' && sessions.get(key) === session) {
+          await drop(session)
+        }
       }
     },
     /** @returns {Promise<void>} settlement after every agent is released. */
@@ -302,8 +424,10 @@ export function createBridge(options) {
  * @returns {string} map key. Auxiliary purposes never share the conversation agent.
  */
 export function sessionKey(request) {
-  const id = request.sessionId === undefined || request.sessionId === '' ? 'default' : String(request.sessionId)
+  const id = request.sessionId === undefined || request.sessionId === ''
+    ? 'default'
+    : encodeURIComponent(String(request.sessionId))
   return request.purpose === undefined || request.purpose === ''
     ? `session:${id}`
-    : `purpose:${id}:${request.purpose}`
+    : `purpose:${id}:${encodeURIComponent(String(request.purpose))}`
 }

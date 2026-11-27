@@ -110,13 +110,77 @@ export function resolveConfig(config) {
     if (!nodePath.isAbsolute(cwd)) throw new Error('dsh-simple-cursor: cwd must be an absolute path')
     let stat
     try {
-      stat = fs.statSync(cwd)
+      stat = fs.lstatSync(cwd)
     } catch {
       throw new Error(`dsh-simple-cursor: cwd does not exist: ${cwd}`)
     }
+    if (stat.isSymbolicLink()) throw new Error(`dsh-simple-cursor: cwd must not be a symbolic link: ${cwd}`)
     if (!stat.isDirectory()) throw new Error(`dsh-simple-cursor: cwd is not a directory: ${cwd}`)
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw new Error(`dsh-simple-cursor: cwd must be owned by the current user: ${cwd}`)
+    }
+    const real = fs.realpathSync(cwd)
+    if (isSensitivePath(real)) {
+      throw new Error(`dsh-simple-cursor: cwd cannot point to a sensitive directory: ${cwd}`)
+    }
   }
   return { cwd, contextWindow }
+}
+
+const SENSITIVE_SYSTEM_ROOTS = [
+  '/bin', '/boot', '/dev', '/etc', '/lib', '/lib64', '/proc', '/root', '/run', '/sbin', '/sys', '/usr', '/var',
+]
+
+const SENSITIVE_HOME_DIRS = [
+  '.ssh', '.gnupg', '.aws', '.kube', '.docker', '.config', '.dsh', '.cursor', '.npm', '.pki',
+]
+
+/**
+ * @param {string} target - real path to check.
+ * @returns {boolean} whether the path is a system directory or user credential directory.
+ */
+function isSensitivePath(target) {
+  const normalized = nodePath.resolve(target)
+  const parsed = nodePath.parse(normalized)
+  if (normalized === parsed.root) return true
+
+  let tmpReal
+  try {
+    tmpReal = fs.realpathSync(os.tmpdir())
+  } catch {
+    tmpReal = nodePath.resolve(os.tmpdir())
+  }
+  if (isSameOrChild(normalized, tmpReal)) return false
+
+  for (const root of SENSITIVE_SYSTEM_ROOTS) {
+    if (isSameOrChild(normalized, root)) return true
+  }
+
+  const home = os.homedir()
+  if (typeof home === 'string' && home.length > 0) {
+    let homeReal
+    try {
+      homeReal = fs.realpathSync(home)
+    } catch {
+      homeReal = nodePath.resolve(home)
+    }
+    for (const dir of SENSITIVE_HOME_DIRS) {
+      if (isSameOrChild(normalized, nodePath.join(homeReal, dir))) return true
+    }
+  }
+  return false
+}
+
+/**
+ * @param {string} candidate - normalized path.
+ * @param {string} base - directory root.
+ * @returns {boolean} whether candidate equals or sits inside base.
+ */
+function isSameOrChild(candidate, base) {
+  const resolvedBase = nodePath.resolve(base)
+  if (candidate === resolvedBase) return true
+  const prefix = resolvedBase.endsWith(nodePath.sep) ? resolvedBase : `${resolvedBase}${nodePath.sep}`
+  return candidate.startsWith(prefix)
 }
 
 /**

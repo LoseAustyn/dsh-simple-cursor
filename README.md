@@ -49,7 +49,7 @@ npm install
 
 如需调整高级选项，可在 profile 的 `cordis.patch.yml` 中为 `id: simple-cursor` 添加 `config`：
 
-- `cwd`：本地 Cursor agent 存放运行状态的目录，须为已存在的绝对路径。默认使用系统临时目录下的 `dsh-simple-cursor`。
+- `cwd`：本地 Cursor agent 使用的作用域目录路径，须为非符号链接、当前用户所有的已存在绝对路径，且不得指向系统目录或 `~/.ssh`、`~/.dsh`、`~/.cursor`、`~/.config` 等敏感目录。默认使用系统临时目录下的 `dsh-simple-cursor`（`0700` 权限，仅作作用域标识并保持为空）。
 - `contextWindow`：当模型目录未返回 `context` 参数时的兜底上下文容量（单位 token），默认为 `128000`。
 
 ## 功能说明
@@ -80,9 +80,10 @@ npm install
 
 ## 安全边界
 
-- **密钥隔离**：API Key 只通过 `ctx.credentials.resolve('CURSOR_API_KEY')` 在服务端读取，浏览器端仅可写入与清除，无法读回明文或短期访问令牌。
-- **受保护的用量接口**：`/api/dsh-simple-cursor/usage` 注册在 DSH `connection` 的认证通道上，复用宿主的同源校验、Cookie 鉴权与 Peer 授权，仅返回脱敏后的额度与百分比字段。
-- **严格限制工具范围**：创建本地 agent 时固定设置 `tools: ['mcp']` 与 `settingSources: []`，禁止加载 Cursor 内置工具及本地项目/用户级 MCP 配置。
+- **密钥隔离**：API Key 只通过 `ctx.credentials.resolve('CURSOR_API_KEY')` 在服务端读取，浏览器端仅可写入与清除，无法读回明文或短期访问令牌；所有上游错误在回传前均做凭据脱敏。
+- **受保护的用量接口**：`/api/dsh-simple-cursor/usage` 注册在 DSH `connection` 的认证通道上，复用宿主的同源校验、Cookie 鉴权与 Peer 授权，具备并发请求去重与手动刷新冷却（3 秒），仅返回脱敏后的额度与百分比字段。
+- **严格限制工具与本地状态边界**：创建本地 agent 时固定设置 `tools: ['mcp']`、`settingSources: []`、`fs: emptyFs()` 与内存 `LocalAgentStore`，关闭 Cursor 内置文件/终端/网页工具与磁盘 SQLite 落盘，并在释放会话时自动清理单 agent 的转录目录；如需清理异常退出残留目录，可手动删除 `~/.cursor/projects/tmp-dsh-simple-cursor/`。
+- **依赖与许可声明**：插件自身采用 MIT 许可，但运行期依赖闭源专有许可的 `@cursor/sdk`（受 [Cursor 服务条款](https://cursor.com/terms-of-service) 约束）及其平台原生二进制可选包（如 `rg`、`cursorsandbox` 与 `tree-sitter` 原生模块）。
 
 完整的威胁模型与安全规则见 [docs/SECURITY.md](docs/SECURITY.md)。
 

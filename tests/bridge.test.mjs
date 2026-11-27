@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import os from 'node:os'
 import nodePath from 'node:path'
 import { describe, it } from 'node:test'
@@ -258,5 +259,145 @@ describe('bridge', () => {
     client.agents[0].sends[0].run.finish({ status: 'finished', result: '' })
     await assert.rejects(collected, (error) => error.code === 'EMPTY_RESPONSE')
     assert.equal(client.agents[0].disposed, true)
+  })
+
+  it('disposes a held session when its signal aborts while waiting for tool results', async () => {
+    const { bridge, client, flush } = harness()
+    const controller = new AbortController()
+    const tools = [{ name: 'bash', description: 'Run a command', parameters: { type: 'object' } }]
+    const iter = bridge.stream(request([user('list')], { tools, signal: controller.signal }), extras)[Symbol.asyncIterator]()
+    const collected = collect(iter)
+    await waitFor(() => client.agents[0]?.sends.length === 1)
+    const send = client.agents[0].sends[0]
+    const parked = send.listeners.onTool({ id: 'call-1', name: 'bash', args: { command: 'ls' } })
+    parked.catch(() => {})
+    flush()
+    await collected
+    assert.equal(client.agents[0].disposed, false)
+
+    controller.abort()
+    await waitFor(() => client.agents[0].disposed === true)
+    assert.equal(send.run.cancelled, true)
+    await assert.rejects(parked, (error) => error.code === 'ABORTED')
+  })
+
+  it('expires an idle session after sessionTtlMs', async () => {
+    const client = createFakeClient()
+    const bridge = createBridge({
+      client,
+      cwd: nodePath.join(os.tmpdir(), 'dsh-simple-cursor-test'),
+      sessionTtlMs: 15,
+    })
+    const iter = bridge.stream(request([user('hi')]), extras)[Symbol.asyncIterator]()
+    const collected = collect(iter)
+    await waitFor(() => client.agents[0]?.sends.length === 1)
+    client.agents[0].sends[0].listeners.onText('Hello')
+    client.agents[0].sends[0].run.finish({ status: 'finished', result: 'Hello', usage })
+    await collected
+    assert.equal(client.agents[0].disposed, false)
+    await waitFor(() => client.agents[0].disposed === true)
+  })
+
+  it('rejects duplicate toolCallIds and enforces parked tool timeouts', async () => {
+    const { bridge, client } = harness()
+    const iter = bridge.stream(request([user('list')]), extras)[Symbol.asyncIterator]()
+    const collected = collect(iter)
+    await waitFor(() => client.agents[0]?.sends.length === 1)
+    const send = client.agents[0].sends[0]
+    const first = send.listeners.onTool({ id: 'dup-1', name: 'read', args: {} })
+    first.catch(() => {})
+    await assert.rejects(
+      send.listeners.onTool({ id: 'dup-1', name: 'read', args: {} }),
+      (error) => error.code === 'INVALID_REQUEST',
+    )
+    await assert.rejects(collected, (error) => error.code === 'INVALID_REQUEST')
+    assert.equal(client.agents[0].disposed, true)
+
+    const client2 = createFakeClient()
+    const bridge2 = createBridge({
+      client: client2,
+      cwd: nodePath.join(os.tmpdir(), 'dsh-simple-cursor-test'),
+      toolTimeoutMs: 15,
+      defer: () => () => {},
+    })
+    const iter2 = bridge2.stream(request([user('wait')]), extras)[Symbol.asyncIterator]()
+    const collected2 = collect(iter2)
+    await waitFor(() => client2.agents[0]?.sends.length === 1)
+    const parked = client2.agents[0].sends[0].listeners.onTool({ id: 'slow-1', name: 'read', args: {} })
+    await assert.rejects(parked, (error) => error.code === 'ABORTED')
+    await assert.rejects(collected2, (error) => error.code === 'ABORTED')
+    assert.equal(client2.agents[0].disposed, true)
+  })
+
+  it('escapes colons in sessionKey and rotates agent when apiKey changes', async () => {
+    assert.notEqual(
+      sessionKey({ sessionId: 'a:b', purpose: 'c' }),
+      sessionKey({ sessionId: 'a', purpose: 'b:c' }),
+    )
+    const { bridge, client } = harness()
+    const iter = bridge.stream(request([user('hi')]), extras)[Symbol.asyncIterator]()
+    const collected = collect(iter)
+    await waitFor(() => client.agents[0]?.sends.length === 1)
+    client.agents[0].sends[0].listeners.onText('Hello')
+    client.agents[0].sends[0].run.finish({ status: 'finished', result: 'Hello', usage })
+    await collected
+
+    const rotated = [
+      user('hi'),
+      { role: 'assistant', content: [{ type: 'text', text: 'Hello' }] },
+      user('again'),
+    ]
+    const iter2 = bridge.stream(request(rotated), { ...extras, apiKey: 'cursor_rotated' })[Symbol.asyncIterator]()
+    const collected2 = collect(iter2)
+    await waitFor(() => client.agents.length === 2)
+    assert.equal(client.agents[0].disposed, true)
+    client.agents[1].sends[0].listeners.onText('new')
+    client.agents[1].sends[0].run.finish({ status: 'finished', result: 'new', usage })
+    await collected2
+    await bridge.dispose()
+  })
+
+  it('creates cwd with 0700 permissions and rejects a symlink cwd', async () => {
+    const tmpRoot = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'dsh-sc-bridge-cwd-'))
+    const createdDir = nodePath.join(tmpRoot, 'new-cwd')
+    const linkDir = nodePath.join(tmpRoot, 'link-cwd')
+    fs.symlinkSync(tmpRoot, linkDir)
+    try {
+      const client = createFakeClient()
+      const bridge = createBridge({ client, cwd: createdDir })
+      const iter = bridge.stream(request([user('hi')]), extras)[Symbol.asyncIterator]()
+      const collected = collect(iter)
+      await waitFor(() => client.agents[0]?.sends.length === 1)
+      client.agents[0].sends[0].listeners.onText('ok')
+      client.agents[0].sends[0].run.finish({ status: 'finished', result: 'ok', usage })
+      await collected
+      assert.equal(fs.statSync(createdDir).mode & 0o777, 0o700)
+      await bridge.dispose()
+
+      const badBridge = createBridge({ client: createFakeClient(), cwd: linkDir })
+      await assert.rejects(
+        collect(badBridge.stream(request([user('hi')]), extras)[Symbol.asyncIterator]()),
+        (error) => error.code === 'INVALID_REQUEST',
+      )
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('redacts sensitive tokens from run error messages', async () => {
+    const { bridge, client } = harness()
+    const iter = bridge.stream(request([user('hi')]), extras)[Symbol.asyncIterator]()
+    const collected = collect(iter)
+    await waitFor(() => client.agents[0]?.sends.length === 1)
+    client.agents[0].sends[0].run.finish({
+      status: 'error',
+      error: { message: 'Bearer secret_123 cursor_key_secret failed' },
+    })
+    await assert.rejects(
+      collected,
+      (error) => error.code === 'TRANSPORT'
+        && !error.message.includes('secret_123')
+        && !error.message.includes('cursor_key_secret'),
+    )
   })
 })

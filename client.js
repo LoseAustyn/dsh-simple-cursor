@@ -13,6 +13,7 @@ window.__ModuleLoader__.load({
     const React = require('react')
     const h = React.createElement
     const { useCallback, useEffect, useId, useState } = React
+    const useRef = React.useRef ?? ((initial) => ({ current: initial }))
 
     /** Locale namespace owned by this plugin. */
     const NS = 'simpleCursor'
@@ -26,10 +27,8 @@ window.__ModuleLoader__.load({
     const ZH = {
       nav: 'Cursor',
       title: 'Cursor 账号',
-      description: '把 Cursor 订阅接到 DSH，作为可选的模型提供方。密钥保存在 DSH 的凭证服务里（CURSOR_API_KEY），不写进插件配置。',
       loading: '正在读取密钥状态…',
       configured: '已配置',
-      configuredFrom: '已配置（来源：{source}）',
       missing: '未配置',
       unavailable: '这个部署没有可用的凭证服务，无法在这里保存密钥。',
       describeFailed: '读取密钥状态失败：{message}',
@@ -58,16 +57,14 @@ window.__ModuleLoader__.load({
       usagePool: '额度池：{total}（基础 {included}，赠送 {bonus}）',
       usageOnDemand: '按量使用：{used} / {limit}',
       usageNoMeter: 'Cursor 没有返回可显示的用量数据。',
-      hint: '在 Cursor Dashboard → Integrations 生成密钥。这里保存的密钥是插件唯一使用的 Cursor 密钥来源。',
+      hint: '在 Cursor Dashboard → Integrations 生成密钥。',
     }
 
     const EN = {
       nav: 'Cursor',
       title: 'Cursor account',
-      description: 'Use a Cursor subscription as an optional DSH model provider. The key lives in the DSH credentials store (CURSOR_API_KEY), not in plugin configuration.',
       loading: 'Reading key status…',
       configured: 'Configured',
-      configuredFrom: 'Configured (source: {source})',
       missing: 'Not configured',
       unavailable: 'This deployment has no credentials service, so the key cannot be saved here.',
       describeFailed: 'Reading key status failed: {message}',
@@ -96,13 +93,12 @@ window.__ModuleLoader__.load({
       usagePool: 'Usage pool: {total} (included {included}, bonus {bonus})',
       usageOnDemand: 'On-demand: {used} / {limit}',
       usageNoMeter: 'Cursor returned no displayable usage data.',
-      hint: 'Mint a key at Cursor Dashboard → Integrations. The key saved here is the only Cursor key source this plugin uses.',
+      hint: 'Mint a key at Cursor Dashboard → Integrations.',
     }
 
     const CSS = `
 .llmc-panel { display: flex; flex-direction: column; gap: 14px; max-width: 620px; }
 .llmc-title { margin: 0; font-size: 15px; font-weight: 600; color: var(--dsw-alias-label-primary); }
-.llmc-desc { margin: 0; font-size: 12.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary); }
 .llmc-status { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--dsw-alias-label-secondary); }
 .llmc-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); flex: none; }
 .llmc-dot[data-on='true'] { background: var(--dsw-alias-state-success-primary); }
@@ -212,6 +208,9 @@ window.__ModuleLoader__.load({
       return function CursorSettings(props) {
         const t = typeof props.t === 'function' ? props.t : (key) => key
         const inputId = useId()
+        const mountedRef = useRef(true)
+        const usageSeqRef = useRef(0)
+        const usageAbortRef = useRef(null)
         const [credential, setCredential] = useState(undefined)
         const [ready, setReady] = useState(false)
         const [busy, setBusy] = useState(false)
@@ -223,9 +222,16 @@ window.__ModuleLoader__.load({
         const [usageError, setUsageError] = useState(undefined)
 
         const loadUsage = useCallback(async (force = false) => {
+          usageAbortRef.current?.abort()
+          const controller = typeof AbortController === 'function' ? new AbortController() : null
+          usageAbortRef.current = controller
+          const seq = usageSeqRef.current + 1
+          usageSeqRef.current = seq
           setUsageState('loading')
           setUsageError(undefined)
-          const result = await ops.usage(force)
+          const result = await ops.usage(force, controller?.signal)
+          if (!mountedRef.current || seq !== usageSeqRef.current || result.aborted === true) return
+          if (usageAbortRef.current === controller) usageAbortRef.current = null
           if (!result.ok) {
             setUsage(undefined)
             setUsageError(result.message ?? '')
@@ -238,17 +244,24 @@ window.__ModuleLoader__.load({
 
         const refresh = useCallback(async () => {
           const result = await ops.describe()
+          if (!mountedRef.current) return
           setReady(true)
           if (result.ok) {
             setCredential(result.credential)
             setError(undefined)
             if (result.credential?.configured === true) await loadUsage()
             else {
+              usageAbortRef.current?.abort()
+              usageAbortRef.current = null
+              usageSeqRef.current += 1
               setUsage(undefined)
               setUsageState('unconfigured')
               setUsageError(undefined)
             }
           } else {
+            usageAbortRef.current?.abort()
+            usageAbortRef.current = null
+            usageSeqRef.current += 1
             setCredential(undefined)
             setUsage(undefined)
             setUsageState('unavailable')
@@ -257,7 +270,15 @@ window.__ModuleLoader__.load({
           }
         }, [loadUsage, t])
 
-        useEffect(() => { void refresh() }, [refresh])
+        useEffect(() => {
+          mountedRef.current = true
+          void refresh()
+          return () => {
+            mountedRef.current = false
+            usageAbortRef.current?.abort()
+            usageAbortRef.current = null
+          }
+        }, [refresh])
 
         const onSubmit = useCallback(async (event) => {
           event.preventDefault()
@@ -265,6 +286,7 @@ window.__ModuleLoader__.load({
           if (value.length === 0) { setError(t('empty')); return }
           setBusy(true); setError(undefined); setNotice(undefined)
           const failure = await ops.save(value)
+          if (!mountedRef.current) return
           setBusy(false)
           if (failure !== undefined) { setError(t('saveFailed', { message: failure })); return }
           setDraft('')
@@ -275,6 +297,7 @@ window.__ModuleLoader__.load({
         const onClear = useCallback(async () => {
           setBusy(true); setError(undefined); setNotice(undefined)
           const failure = await ops.clear()
+          if (!mountedRef.current) return
           setBusy(false)
           if (failure !== undefined) { setError(t('clearFailed', { message: failure })); return }
           setNotice(t('cleared'))
@@ -285,9 +308,7 @@ window.__ModuleLoader__.load({
         const statusText = !ready
           ? t('loading')
           : configured
-            ? (typeof credential.source === 'string' && credential.source.length > 0
-              ? t('configuredFrom', { source: credential.source })
-              : t('configured'))
+            ? t('configured')
             : t('missing')
 
         let usageContent
@@ -339,7 +360,6 @@ window.__ModuleLoader__.load({
           h('style', { key: 'styles' }, CSS),
           h('section', { className: 'llmc-panel', 'aria-label': t('title') },
             h('h3', { className: 'llmc-title' }, t('title')),
-            h('p', { className: 'llmc-desc' }, t('description')),
             h('p', { className: 'llmc-status', role: 'status' },
               h('span', { className: 'llmc-dot', 'data-on': configured ? 'true' : 'false', 'aria-hidden': true }),
               statusText),
@@ -417,13 +437,14 @@ window.__ModuleLoader__.load({
             return error instanceof Error ? error.message : String(error)
           }
         },
-        async usage(force = false) {
+        async usage(force = false, signal) {
           try {
             const response = await fetch(force ? `${USAGE_PATH}?refresh=1` : USAGE_PATH, {
               method: 'GET',
               credentials: 'same-origin',
               headers: { accept: 'application/json' },
               cache: 'no-store',
+              ...(signal === undefined ? {} : { signal }),
             })
             let payload
             try { payload = await response.json() } catch { payload = undefined }
@@ -439,6 +460,9 @@ window.__ModuleLoader__.load({
             }
             return { ok: true, usage: payload.usage }
           } catch (error) {
+            if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+              return { ok: false, aborted: true }
+            }
             return { ok: false, code: 'usageUnavailable', message: error instanceof Error ? error.message : String(error) }
           }
         },

@@ -49,7 +49,7 @@ Once a key is configured, **More → Settings → Cursor** displays your subscri
 
 Advanced settings can be placed under `config` on the `id: simple-cursor` entry in your profile's `cordis.patch.yml`:
 
-- `cwd` — Existing absolute directory path where local Cursor agents keep runtime state. Defaults to `dsh-simple-cursor` under the OS temporary directory.
+- `cwd` — Existing, non-symlink, user-owned absolute directory path used as the SDK workspace identifier (system directories and sensitive credential folders such as `~/.ssh`, `~/.dsh`, `~/.cursor`, `~/.config` are rejected). Defaults to `dsh-simple-cursor` under the OS temporary directory with `0700` permissions (kept empty).
 - `contextWindow` — Fallback context window (in tokens) used only when a model's catalog entry does not advertise a `context` parameter. Defaults to `128000`.
 
 ## Features
@@ -80,9 +80,10 @@ Once loaded, **Cursor** appears in the DSH model selector. The adapter fetches y
 
 ## Security
 
-- **Credential isolation**: The API key is read exclusively on the host via `ctx.credentials.resolve('CURSOR_API_KEY')`. The browser can save or clear it, but never receives the raw key or short-lived access tokens.
-- **Authenticated usage endpoint**: `/api/dsh-simple-cursor/usage` is registered on DSH `connection`'s authenticated `/api` transport, inheriting host origin checks, cookie authentication, and owner-peer authorization, and returns only normalized percentages and quota fields.
-- **Locked tool boundary**: Local agents are created with `tools: ['mcp']` and `settingSources: []`, keeping Cursor's built-in tools and ambient user/project MCP servers turned off.
+- **Credential isolation**: The API key is read exclusively on the host via `ctx.credentials.resolve('CURSOR_API_KEY')`. The browser can save or clear it, but never receives the raw key or short-lived access tokens; upstream error messages are redacted before surfacing.
+- **Authenticated usage endpoint**: `/api/dsh-simple-cursor/usage` is registered on DSH `connection`'s authenticated `/api` transport, inheriting host origin checks, cookie authentication, and owner-peer authorization, with in-flight request deduplication, a 3-second cooldown on manual refreshes, and normalized quota output.
+- **Locked tool & local-state boundary**: Local agents are created with `tools: ['mcp']`, `settingSources: []`, `fs: emptyFs()`, and an in-memory `LocalAgentStore`, disabling Cursor's built-in file/shell/web executors and SQLite persistence while automatically cleaning up per-agent transcript directories on disposal (if a process crashes unexpectedly, `~/.cursor/projects/tmp-dsh-simple-cursor/` can be safely removed manually).
+- **Proprietary dependency notice**: While this plugin is MIT-licensed, its runtime depends on the proprietary `@cursor/sdk` package (governed by [Cursor's Terms of Service](https://cursor.com/terms-of-service)) and platform-specific native binaries (`rg`, `cursorsandbox`, and `tree-sitter` native bindings).
 
 See [docs/SECURITY.md](docs/SECURITY.md) for the full threat model and security rules.
 

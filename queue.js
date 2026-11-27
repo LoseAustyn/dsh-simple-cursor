@@ -6,7 +6,15 @@
 
 import { failure } from './errors.js'
 
-export function createQueue() {
+/** Maximum buffered events per stream queue before failing closed. */
+export const MAX_QUEUE_ITEMS = 10_000
+
+/**
+ * @param {{ maxItems?: number }} [options] - queue bounds.
+ * @returns {{ push: (item: unknown) => void, fail: (error: Error) => void, next: (signal?: AbortSignal) => Promise<unknown> }} queue.
+ */
+export function createQueue(options = {}) {
+  const maxItems = options.maxItems ?? MAX_QUEUE_ITEMS
   /** @type {unknown[]} */
   const items = []
   /** @type {Array<() => void>} */
@@ -27,6 +35,11 @@ export function createQueue() {
      */
     push(item) {
       if (stopped) return
+      if (items.length >= maxItems) {
+        stopped = failure('Cursor stream event buffer exceeded', 'TRANSPORT')
+        wake()
+        return
+      }
       items.push(item)
       wake()
     },
