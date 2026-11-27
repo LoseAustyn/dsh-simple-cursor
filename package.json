@@ -4,6 +4,10 @@
   "private": true,
   "description": "Simple Cursor: a third-party DSH plugin that uses a Cursor subscription as a model provider through the official Cursor SDK. Not affiliated with Cursor.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LoseAustyn/dsh-simple-cursor.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.13",
